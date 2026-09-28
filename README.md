@@ -46,6 +46,7 @@ All secrets come from environment variables — nothing is hardcoded:
 | `MODEL_NAME` | yes | Model name, e.g. `gpt-4o-mini` |
 | `SERPER_KEY` | yes | Serper API key (web search tool) |
 | `JINA_KEY` | yes | Jina API key (web fetch/reader tool) |
+| `MINERU_TOKEN` | yes | MinerU API token (PDF parsing tool) |
 | `TEMPERATURE` / `TOP_P` | no | Sampling params (defaults 0.6 / 0.95) |
 | `MAX_ROUNDS` | no | Max agent rounds per run (default 500) |
 | `MAX_RUNTIME_SECONDS` | no | Wall-clock budget per run |
@@ -55,7 +56,7 @@ You can also drop these in a `.env` file — it's loaded automatically.
 ## CLI Usage
 
 ```bash
-export API_KEY=... API_BASE=... MODEL_NAME=... SERPER_KEY=... JINA_KEY=...
+export API_KEY=... API_BASE=... MODEL_NAME=... SERPER_KEY=... JINA_KEY=... MINERU_TOKEN=...
 
 # Run a task
 python run_agent.py "Research recent progress in small language models and save a summary to notes/slm.md"
