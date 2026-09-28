@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "researchharness"
+dynamic = ["version", "dependencies"]
+description = "A lightweight, general harness for tool-using LLM agents."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Huzaifa Aqeel" },
+]
+keywords = [
+  "llm",
+  "agent",
+  "harness",
+  "benchmark",
+  "tool-use",
+  "research",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/HuzaifaAqeel/Agent-Research-Harness"
+Repository = "https://github.com/HuzaifaAqeel/Agent-Research-Harness"
+Issues = "https://github.com/HuzaifaAqeel/Agent-Research-Harness/issues"
+
+[project.scripts]
+rh-agent = "agent_base.react_agent:main"
+rh-server = "run_server:main"
+rh-frontend = "run_frontend:main"
+
+[tool.setuptools]
+include-package-data = true
+py-modules = ["run_agent", "run_server", "run_frontend"]
+
+[tool.setuptools.dynamic]
+version = { file = ["VERSION"] }
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+  "agent_base*",
+  "api*",
+  "frontend*",
+  "researchharness*",
+  "benchmarks*",
+]
+namespaces = true
+
+[tool.setuptools.package-data]
+agent_base = ["prompts/*.md", "prompts/**/*.md"]
+frontend = ["static/*"]
+benchmarks = ["**/*.md", "**/*.png"]
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"

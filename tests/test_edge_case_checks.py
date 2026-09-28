@@ -1,0 +1,2531 @@
+#!/usr/bin/env python3
+
+import json
+import os
+import re
+import shutil
+import sys
+import threading
+import time
+import types
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+from PIL import Image
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from test_support import TEST_RUNS_DIR, bootstrap, load_trace_records, preview, single_trace_path
+
+
+TMP_DIR = TEST_RUNS_DIR / "edge_case_checks"
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+@dataclass
+class EdgeCaseResult:
+    status: str
+    detail: str
+    output_preview: str
+
+
+def strip_ansi(text: str) -> str:
+    return ANSI_ESCAPE_RE.sub("", text).replace("\r", "")
+
+
+def check_workspace_root_is_created_when_missing() -> tuple[bool, str]:
+    from agent_base.tools.tooling import normalize_workspace_root
+
+    case_dir = TMP_DIR / "workspace_root_auto_create" / "fresh_workspace"
+    shutil.rmtree(case_dir.parent, ignore_errors=True)
+    resolved = normalize_workspace_root(case_dir)
+    ok = resolved == case_dir.resolve() and resolved.is_dir()
+    return ok, json.dumps({"resolved": str(resolved), "exists": resolved.exists()}, indent=2)
+
+
+def check_required_env_is_enforced() -> tuple[bool, str]:
+    from agent_base.utils import REQUIRED_ENV_VARS, MissingRequiredEnvError, require_required_env
+
+    previous = {key: os.environ.get(key) for key in REQUIRED_ENV_VARS}
+    try:
+        for key in REQUIRED_ENV_VARS:
+            os.environ.pop(key, None)
+        try:
+            require_required_env("test context")
+        except MissingRequiredEnvError as exc:
+            text = str(exc)
+            missing = [key for key in REQUIRED_ENV_VARS if key in text]
+            ok = len(missing) == len(REQUIRED_ENV_VARS) and "test context missing required environment variables" in text
+            return ok, json.dumps({"error": text, "missing_reported": missing}, indent=2)
+        return False, json.dumps({"error": "missing env did not raise"}, indent=2)
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def check_llm_hard_timeout_interrupts_blocking_call() -> tuple[bool, str]:
+    from agent_base.react_agent import LLMHardTimeoutError, llm_hard_timeout
+
+    start = time.time()
+    try:
+        with llm_hard_timeout(0.2):
+            time.sleep(5)
+    except LLMHardTimeoutError as exc:
+        elapsed = time.time() - start
+        ok = elapsed < 1.5
+        return ok, json.dumps({"elapsed_seconds": elapsed, "error": str(exc)}, indent=2)
+    elapsed = time.time() - start
+    return False, json.dumps({"elapsed_seconds": elapsed, "error": "timeout did not fire"}, indent=2)
+
+
+def check_readpdf_relative_image_path() -> tuple[bool, str]:
+    from agent_base.tools.tool_file import ReadPDF
+
+    case_dir = TMP_DIR / "readpdf_relative_image"
+    shutil.rmtree(case_dir, ignore_errors=True)
+    case_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = case_dir / "dummy.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n%dummy\n")
+    image_dir = case_dir / "fake_extracted"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    image_path = image_dir / "figure1.png"
+    Image.new("RGB", (8, 8), color="white").save(image_path)
+
+    fake_root = case_dir / "fake_modules"
+    fake_root.mkdir(parents=True, exist_ok=True)
+    (fake_root / "structai.py").write_text(
+        "def read_pdf(path):\n"
+        "    return {'text': '', 'img_paths': ['fake_extracted/figure1.png']}\n",
+        encoding="utf-8",
+    )
+    previous_structai = sys.modules.get("structai")
+    previous_pythonpath = os.environ.get("PYTHONPATH")
+    sys.modules.pop("structai", None)
+    sys.path.insert(0, str(fake_root))
+    os.environ["PYTHONPATH"] = (
+        str(fake_root) if not previous_pythonpath else str(fake_root) + os.pathsep + previous_pythonpath
+    )
+    try:
+        result = ReadPDF().call({"path": str(pdf_path)}, workspace_root=case_dir)
+    finally:
+        if str(fake_root) in sys.path:
+            sys.path.remove(str(fake_root))
+        if previous_pythonpath is None:
+            os.environ.pop("PYTHONPATH", None)
+        else:
+            os.environ["PYTHONPATH"] = previous_pythonpath
+        if previous_structai is None:
+            sys.modules.pop("structai", None)
+        else:
+            sys.modules["structai"] = previous_structai
+
+    ok = (
+        isinstance(result, str)
+        and not result.startswith("[ReadPDF] Error")
+        and "source_type: pdf" in result
+        and str(image_path.resolve()) in result
+    )
+    return ok, str(result)
+
+
+def check_readpdf_timeout_returns_tool_result() -> tuple[bool, str]:
+    from agent_base.tools.tool_file import ReadPDF
+
+    case_dir = TMP_DIR / "readpdf_timeout"
+    shutil.rmtree(case_dir, ignore_errors=True)
+    case_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = case_dir / "slow.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n%slow\n")
+    fake_root = case_dir / "fake_modules"
+    fake_root.mkdir(parents=True, exist_ok=True)
+    (fake_root / "structai.py").write_text(
+        "import time\n"
+        "def read_pdf(path):\n"
+        "    time.sleep(5)\n"
+        "    return {'text': 'too late', 'img_paths': []}\n",
+        encoding="utf-8",
+    )
+
+    previous_structai = sys.modules.get("structai")
+    previous_pythonpath = os.environ.get("PYTHONPATH")
+    previous_timeout = os.environ.get("READPDF_TIMEOUT_SECONDS")
+    sys.modules.pop("structai", None)
+    sys.path.insert(0, str(fake_root))
+    os.environ["PYTHONPATH"] = (
+        str(fake_root) if not previous_pythonpath else str(fake_root) + os.pathsep + previous_pythonpath
+    )
+    os.environ["READPDF_TIMEOUT_SECONDS"] = "0.2"
+    started_at = time.time()
+    try:
+        result = ReadPDF().call({"path": str(pdf_path)}, workspace_root=case_dir)
+    finally:
+        if str(fake_root) in sys.path:
+            sys.path.remove(str(fake_root))
+        if previous_pythonpath is None:
+            os.environ.pop("PYTHONPATH", None)
+        else:
+            os.environ["PYTHONPATH"] = previous_pythonpath
+        if previous_timeout is None:
+            os.environ.pop("READPDF_TIMEOUT_SECONDS", None)
+        else:
+            os.environ["READPDF_TIMEOUT_SECONDS"] = previous_timeout
+        if previous_structai is None:
+            sys.modules.pop("structai", None)
+        else:
+            sys.modules["structai"] = previous_structai
+    elapsed = time.time() - started_at
+
+    ok = (
+        isinstance(result, str)
+        and result.startswith("[ReadPDF] Timeout after")
+        and "while parsing PDF" in result
+        and "slow.pdf" in result
+        and elapsed < 4.0
+    )
+    return ok, json.dumps({"elapsed_seconds": elapsed, "result": result}, ensure_ascii=False, indent=2)
+
+
+def check_terminal_interrupt_preserves_remainder() -> tuple[bool, str]:
+    from agent_base.tools.tool_runtime import TerminalInterrupt, TerminalKill, TerminalRead, TerminalStart, TerminalWrite
+
+    case_dir = TMP_DIR / "terminal_interrupt_remainder"
+    case_dir.mkdir(parents=True, exist_ok=True)
+
+    outputs: list[str] = []
+    start_result = TerminalStart().call({"cwd": str(case_dir)}, workspace_root=case_dir)
+    outputs.append(start_result)
+    session_match = re.search(r"session_id: (term_\d+)", start_result)
+    if not session_match:
+        return False, "\n\n".join(outputs)
+    session_id = session_match.group(1)
+
+    try:
+        write_result = TerminalWrite().call(
+            {
+                "session_id": session_id,
+                "input": "sleep 0.2; printf 'ABCDEFGHIJ'; sleep 10",
+                "yield_time_ms": 0,
+            },
+            workspace_root=case_dir,
+        )
+        outputs.append(write_result)
+        time.sleep(0.4)
+        interrupt_result = TerminalInterrupt().call(
+            {
+                "session_id": session_id,
+                "max_output_chars": 4,
+            },
+            workspace_root=case_dir,
+        )
+        outputs.append(interrupt_result)
+        read_result = TerminalRead().call(
+            {
+                "session_id": session_id,
+                "yield_time_ms": 200,
+                "max_output_chars": 4000,
+            },
+            workspace_root=case_dir,
+        )
+        outputs.append(read_result)
+    finally:
+        outputs.append(TerminalKill().call({"session_id": session_id}, workspace_root=case_dir))
+
+    cleaned_interrupt = strip_ansi(interrupt_result)
+    cleaned_read = strip_ansi(read_result)
+    ok = "Sent Ctrl-C" in interrupt_result and "EFGHIJ" in cleaned_read and "ABCDEFGHIJ" in (cleaned_interrupt + cleaned_read)
+    return ok, "\n\n".join(outputs)
+
+
+def check_agent_runtime_limit_on_tool_execution() -> tuple[bool, str]:
+    from agent_base.react_agent import MultiTurnReactAgent
+
+    case_dir = TMP_DIR / "agent_runtime_limit"
+    case_dir.mkdir(parents=True, exist_ok=True)
+
+    class FakeAgent(MultiTurnReactAgent):
+        def __init__(self):
+            super().__init__(
+                function_list=["Bash"],
+                llm={
+                    "model": "fake-model",
+                    "generate_cfg": {
+                        "max_input_tokens": 32768,
+                        "max_retries": 1,
+                        "temperature": 0.0,
+                        "top_p": 1.0,
+                        "presence_penalty": 0.0,
+                    },
+                },
+            )
+            self._turn = 0
+
+        def call_llm_api(self, msgs, max_tries=10, runtime_deadline=None):
+            self._turn += 1
+            if self._turn == 1:
+                return {
+                    "status": "ok",
+                    "finish_reason": "tool_calls",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_fake_bash",
+                            "type": "function",
+                            "function": {
+                                "name": "Bash",
+                                "arguments": json.dumps({"command": "sleep 2", "timeout": 30}),
+                            },
+                        }
+                    ],
+                }
+            return {
+                "status": "ok",
+                "finish_reason": "stop",
+                "content": "done",
+                "tool_calls": [],
+            }
+
+    previous_runtime = os.environ.get("MAX_RUNTIME_SECONDS")
+    os.environ["MAX_RUNTIME_SECONDS"] = "1"
+    try:
+        agent = FakeAgent()
+        started_at = time.time()
+        session = agent._run_session("trigger the slow bash tool", workspace_root=str(case_dir))
+        elapsed = time.time() - started_at
+    finally:
+        if previous_runtime is None:
+            os.environ.pop("MAX_RUNTIME_SECONDS", None)
+        else:
+            os.environ["MAX_RUNTIME_SECONDS"] = previous_runtime
+
+    detail = json.dumps(
+        {
+            "termination": session.get("termination"),
+            "result_text": session.get("result_text"),
+            "elapsed_seconds": round(elapsed, 3),
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    ok = (
+        isinstance(session.get("termination"), str)
+        and session["termination"].startswith("agent runtime limit reached")
+        and elapsed < 1.8
+    )
+    return ok, detail
+
+
+def check_parallel_readimage_tool_message_order() -> tuple[bool, str]:
+    from agent_base.react_agent import MultiTurnReactAgent
+
+    case_dir = TMP_DIR / "parallel_readimage_tool_messages"
+    case_dir.mkdir(parents=True, exist_ok=True)
+
+    class FakeAgent(MultiTurnReactAgent):
+        def __init__(self):
+            super().__init__(
+                function_list=["ReadImage"],
+                llm={
+                    "model": "fake-model",
+                    "generate_cfg": {
+                        "max_input_tokens": 32768,
+                        "max_retries": 1,
+                        "temperature": 0.0,
+                        "top_p": 1.0,
+                        "presence_penalty": 0.0,
+                    },
+                },
+            )
+            self._turn = 0
+            self.seen_messages = []
+            self.events: dict[str, dict[str, float]] = {}
+            self.event_lock = threading.Lock()
+
+        def call_llm_api(self, msgs, max_tries=10, runtime_deadline=None):
+            self.seen_messages = msgs
+            self._turn += 1
+            if self._turn == 1:
+                return {
+                    "status": "ok",
+                    "finish_reason": "tool_calls",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_img_1",
+                            "type": "function",
+                            "function": {
+                                "name": "ReadImage",
+                                "arguments": json.dumps({"path": "img1.jpg"}),
+                            },
+                        },
+                        {
+                            "id": "call_img_2",
+                            "type": "function",
+                            "function": {
+                                "name": "ReadImage",
+                                "arguments": json.dumps({"path": "img2.jpg"}),
+                            },
+                        },
+                        {
+                            "id": "call_img_3",
+                            "type": "function",
+                            "function": {
+                                "name": "ReadImage",
+                                "arguments": json.dumps({"path": "img3.jpg"}),
+                            },
+                        },
+                    ],
+                }
+            return {
+                "status": "ok",
+                "finish_reason": "stop",
+                "content": "done",
+                "tool_calls": [],
+            }
+
+        def custom_call_tool(self, tool_name: str, tool_args: object, **kwargs):
+            path = tool_args["path"] if isinstance(tool_args, dict) else "unknown"
+            started = time.monotonic()
+            time.sleep(0.1)
+            ended = time.monotonic()
+            with self.event_lock:
+                self.events[path] = {"started": started, "ended": ended}
+            return {
+                "kind": "image_tool_result",
+                "text": f"path: {path}\nllm_image_attached: true",
+                "path": str(case_dir / path),
+                "image_url": "data:image/jpeg;base64,ZmFrZQ==",
+            }
+
+    agent = FakeAgent()
+    session = agent._run_session("inspect three images", workspace_root=str(case_dir))
+    roles_after_assistant = [msg.get("role") for msg in agent.seen_messages[2:]]
+    readimage_calls_overlap = max(event["started"] for event in agent.events.values()) < min(
+        event["ended"] for event in agent.events.values()
+    )
+    detail = json.dumps(
+        {
+            "termination": session.get("termination"),
+            "result_text": session.get("result_text"),
+            "roles_after_assistant": roles_after_assistant,
+            "readimage_calls_overlap": readimage_calls_overlap,
+            "messages_seen": agent.seen_messages,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    ok = (
+        session.get("termination") == "result"
+        and session.get("result_text") == "done"
+        and roles_after_assistant[:7] == ["assistant", "tool", "tool", "tool", "user", "user", "user"]
+        and len(roles_after_assistant) == 7
+        and readimage_calls_overlap
+    )
+    return ok, detail
+
+
+def check_tool_execution_batches_keep_mutation_boundaries() -> tuple[bool, str]:
+    from agent_base.react_agent import can_parallelize_tool_name, tool_execution_batches
+
+    tool_names = ["Read", "Read", "Edit", "Read", "WebSearch", "Bash", "WebFetch", "ScholarSearch"]
+    batches = tool_execution_batches(tool_names)
+    parallelizable = {name: can_parallelize_tool_name(name) for name in tool_names}
+    detail = json.dumps(
+        {
+            "tool_names": tool_names,
+            "batches": batches,
+            "parallelizable": parallelizable,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    ok = (
+        batches == [[0, 1], [2], [3, 4], [5], [6, 7]]
+        and parallelizable["Read"]
+        and parallelizable["WebSearch"]
+        and parallelizable["ScholarSearch"]
+        and parallelizable["WebFetch"]
+        and not parallelizable["Edit"]
+        and not parallelizable["Bash"]
+    )
+    return ok, detail
+
+
+def check_deepseek_readimage_falls_back_to_text_only_context() -> tuple[bool, str]:
+    from agent_base.react_agent import MultiTurnReactAgent
+
+    case_dir = TMP_DIR / "deepseek_readimage_text_fallback"
+    shutil.rmtree(case_dir, ignore_errors=True)
+    case_dir.mkdir(parents=True, exist_ok=True)
+
+    class FakeAgent(MultiTurnReactAgent):
+        def __init__(self):
+            super().__init__(
+                function_list=["ReadImage"],
+                llm={
+                    "model": "deepseek-v4-pro",
+                    "generate_cfg": {
+                        "max_input_tokens": 32768,
+                        "max_retries": 1,
+                        "temperature": 0.0,
+                        "top_p": 1.0,
+                        "presence_penalty": 0.0,
+                    },
+                },
+            )
+            self._turn = 0
+            self.second_round_messages = []
+
+        def call_llm_api(self, msgs, max_tries=10, runtime_deadline=None):
+            self._turn += 1
+            if self._turn == 1:
+                return {
+                    "status": "ok",
+                    "finish_reason": "tool_calls",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_img_1",
+                            "type": "function",
+                            "function": {
+                                "name": "ReadImage",
+                                "arguments": json.dumps({"path": "img1.jpg"}),
+                            },
+                        }
+                    ],
+                }
+            self.second_round_messages = msgs
+            return {
+                "status": "ok",
+                "finish_reason": "stop",
+                "content": "done",
+                "tool_calls": [],
+            }
+
+        def custom_call_tool(self, tool_name: str, tool_args: object, **kwargs):
+            path = tool_args["path"] if isinstance(tool_args, dict) else "unknown"
+            return {
+                "kind": "image_tool_result",
+                "text": f"path: {path}\nllm_image_attached: true",
+                "path": str(case_dir / path),
+                "image_url": "data:image/jpeg;base64,ZmFrZQ==",
+            }
+
+    agent = FakeAgent()
+    session = agent._run_session("inspect one image with deepseek", workspace_root=str(case_dir))
+    fallback_user_message = next(
+        (
+            msg
+            for msg in agent.second_round_messages
+            if msg.get("role") == "user"
+            and isinstance(msg.get("content"), str)
+            and "does not accept runtime image content parts" in msg.get("content", "")
+        ),
+        None,
+    )
+    detail = json.dumps(
+        {
+            "termination": session.get("termination"),
+            "result_text": session.get("result_text"),
+            "fallback_user_message": fallback_user_message,
+            "messages_seen": agent.second_round_messages,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    ok = (
+        session.get("termination") == "result"
+        and session.get("result_text") == "done"
+        and fallback_user_message is not None
+    )
+    return ok, detail
+
+
+def check_old_image_parts_are_omitted_from_followup_requests_but_traced() -> tuple[bool, str]:
+    from agent_base.react_agent import MultiTurnReactAgent
+
+    case_dir = TMP_DIR / "old_image_parts_omitted"
+    trace_dir = TMP_DIR / "old_image_parts_omitted_trace"
+    shutil.rmtree(case_dir, ignore_errors=True)
+    shutil.rmtree(trace_dir, ignore_errors=True)
+    case_dir.mkdir(parents=True, exist_ok=True)
+    trace_dir.mkdir(parents=True, exist_ok=True)
+
+    first_image = "data:image/png;base64,Zmlyc3Q="
+    second_image = "data:image/png;base64,c2Vjb25k"
+
+    class FakeAgent(MultiTurnReactAgent):
+        def __init__(self):
+            super().__init__(
+                function_list=["ReadImage"],
+                llm={
+                    "model": "fake-vision-model",
+                    "generate_cfg": {
+                        "max_input_tokens": 32768,
+                        "max_retries": 1,
+                        "temperature": 0.0,
+                        "top_p": 1.0,
+                        "presence_penalty": 0.0,
+                    },
+                },
+                trace_dir=str(trace_dir),
+            )
+            self.calls: list[list[dict]] = []
+
+        def call_llm_api(self, msgs, max_tries=10, runtime_deadline=None):
+            self.calls.append(json.loads(json.dumps(msgs)))
+            if len(self.calls) == 1:
+                return {
+                    "status": "ok",
+                    "finish_reason": "tool_calls",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_img",
+                            "type": "function",
+                            "function": {
+                                "name": "ReadImage",
+                                "arguments": json.dumps({"path": "second.png"}),
+                            },
+                        }
+                    ],
+                }
+            return {
+                "status": "ok",
+                "finish_reason": "stop",
+                "content": "done",
+                "tool_calls": [],
+            }
+
+        def custom_call_tool(self, tool_name: str, tool_args: object, **kwargs):
+            return {
+                "kind": "image_tool_result",
+                "text": f"path: {case_dir / 'second.png'}\nllm_image_attached: true",
+                "path": str(case_dir / "second.png"),
+                "image_url": second_image,
+            }
+
+    agent = FakeAgent()
+    session = agent._run_session(
+        "inspect images",
+        workspace_root=str(case_dir),
+        initial_content_parts=[{"type": "image_url", "image_url": {"url": first_image, "detail": "auto"}}],
+    )
+    second_call = agent.calls[1] if len(agent.calls) > 1 else []
+    second_call_text = json.dumps(second_call, ensure_ascii=False)
+    trace_records = load_trace_records(single_trace_path(trace_dir))
+    llm_records = [row for row in trace_records if row.get("capture_type") == "llm_call"]
+    last_payload = llm_records[-1].get("payload", {}) if llm_records else {}
+    request_text = json.dumps(last_payload.get("request_messages", []), ensure_ascii=False)
+    image_aging = last_payload.get("image_aging", {})
+    image_aging_text = json.dumps(image_aging, ensure_ascii=False)
+    session_state_path = Path(session["session_state_path"])
+    session_state_text = session_state_path.read_text(encoding="utf-8")
+    ok = (
+        session.get("termination") == "result"
+        and session_state_path.exists()
+        and session_state_path.name.startswith("session_state_")
+        and session_state_path.name.removeprefix("session_state_").removesuffix(".json")
+        == Path(session["trace_path"]).name.removeprefix("trace_").removesuffix(".jsonl")
+        and first_image not in second_call_text
+        and second_image in second_call_text
+        and "Previous image omitted" in second_call_text
+        and first_image not in request_text
+        and "full_messages_before_request" not in last_payload
+        and image_aging.get("omitted_image_count") == 1
+        and first_image not in image_aging_text
+        and "base64 omitted" in image_aging_text
+        and first_image in session_state_text
+        and second_image in session_state_text
+    )
+    detail = json.dumps(
+        {
+            "termination": session.get("termination"),
+            "second_call_contains_first_image": first_image in second_call_text,
+            "second_call_contains_second_image": second_image in second_call_text,
+            "request_contains_first_image": first_image in request_text,
+            "has_full_messages_before_request": "full_messages_before_request" in last_payload,
+            "image_aging": image_aging,
+            "image_aging_contains_first_image": first_image in image_aging_text,
+            "session_state_contains_first_image": first_image in session_state_text,
+            "session_state_contains_second_image": second_image in session_state_text,
+            "second_call": second_call,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    return ok, detail
+
+
+def check_reasoning_content_is_preserved_across_tool_rounds() -> tuple[bool, str]:
+    from agent_base.react_agent import MultiTurnReactAgent
+
+    case_dir = TMP_DIR / "reasoning_content_roundtrip"
+    shutil.rmtree(case_dir, ignore_errors=True)
+    case_dir.mkdir(parents=True, exist_ok=True)
+
+    class FakeAgent(MultiTurnReactAgent):
+        def __init__(self):
+            super().__init__(
+                function_list=["Write"],
+                llm={
+                    "model": "fake-model",
+                    "generate_cfg": {
+                        "max_input_tokens": 32768,
+                        "max_retries": 1,
+                        "temperature": 0.0,
+                        "top_p": 1.0,
+                        "presence_penalty": 0.0,
+                    },
+                },
+            )
+            self._turn = 0
+            self.second_round_messages = []
+
+        def call_llm_api(self, msgs, max_tries=10, runtime_deadline=None):
+            self._turn += 1
+            if self._turn == 1:
+                return {
+                    "status": "ok",
+                    "finish_reason": "tool_calls",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_write_plan",
+                            "type": "function",
+                            "function": {
+                                "name": "Write",
+                                "arguments": json.dumps(
+                                    {
+                                        "path": "outputs/marker.txt",
+                                        "content": "tool completed\n",
+                                    }
+                                ),
+                            },
+                        }
+                    ],
+                    "reasoning_content": "deepseek-thinking-token-stream",
+                    "raw_message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_write_plan",
+                                "type": "function",
+                                "function": {
+                                    "name": "Write",
+                                    "arguments": json.dumps(
+                                        {
+                                            "path": "outputs/marker.txt",
+                                            "content": "tool completed\n",
+                                        }
+                                    ),
+                                },
+                                "index": 0,
+                            }
+                        ],
+                        "reasoning_content": "deepseek-thinking-token-stream",
+                    },
+                }
+            self.second_round_messages = msgs
+            return {
+                "status": "ok",
+                "finish_reason": "stop",
+                "content": "done",
+                "tool_calls": [],
+            }
+
+    agent = FakeAgent()
+    session = agent._run_session("Preserve reasoning content after tool use", workspace_root=str(case_dir))
+    assistant_messages = [msg for msg in agent.second_round_messages if msg.get("role") == "assistant"]
+    preserved_message = next(
+        (
+            msg
+            for msg in assistant_messages
+            if msg.get("reasoning_content") == "deepseek-thinking-token-stream"
+            and msg.get("tool_calls")
+            and msg["tool_calls"][0].get("index") == 0
+        ),
+        None,
+    )
+    detail = json.dumps(
+        {
+            "termination": session.get("termination"),
+            "result_text": session.get("result_text"),
+            "assistant_messages": assistant_messages,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    ok = (
+        session.get("termination") == "result"
+        and session.get("result_text") == "done"
+        and preserved_message is not None
+    )
+    return ok, detail
+
+
+def check_visible_think_and_answer_tags_are_plain_final_text() -> tuple[bool, str]:
+    from agent_base.react_agent import MultiTurnReactAgent
+
+    case_dir = TMP_DIR / "visible_think_answer_tags"
+    shutil.rmtree(case_dir, ignore_errors=True)
+    case_dir.mkdir(parents=True, exist_ok=True)
+
+    class FakeAgent(MultiTurnReactAgent):
+        def __init__(self):
+            super().__init__(
+                function_list=["Write"],
+                llm={
+                    "model": "fake-model",
+                    "generate_cfg": {
+                        "max_input_tokens": 32768,
+                        "max_retries": 1,
+                        "temperature": 0.0,
+                        "top_p": 1.0,
+                        "presence_penalty": 0.0,
+                    },
+                },
+            )
+            self._turn = 0
+
+        def call_llm_api(self, msgs, max_tries=10, runtime_deadline=None):
+            self._turn += 1
+            return {
+                "status": "ok",
+                "finish_reason": "stop",
+                "content": "<think>brief visible reasoning</think>\n<answer>I have already solved it.</answer>",
+                "tool_calls": [],
+            }
+
+    agent = FakeAgent()
+    session = agent._run_session("Accept visible reasoning and answer tags as final text", workspace_root=str(case_dir))
+    detail = json.dumps(
+        {
+            "termination": session.get("termination"),
+            "result_text": session.get("result_text"),
+            "turns": agent._turn,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    ok = (
+        session.get("termination") == "result"
+        and "<think>brief visible reasoning</think>" in session.get("result_text", "")
+        and "<answer>I have already solved it.</answer>" in session.get("result_text", "")
+        and agent._turn == 1
+    )
+    return ok, detail
+
+
+def check_tool_like_text_tags_can_be_plain_final_text() -> tuple[bool, str]:
+    from agent_base.react_agent import MultiTurnReactAgent
+
+    case_dir = TMP_DIR / "tool_like_text_tags_allowed"
+    shutil.rmtree(case_dir, ignore_errors=True)
+    case_dir.mkdir(parents=True, exist_ok=True)
+
+    class FakeAgent(MultiTurnReactAgent):
+        def __init__(self):
+            super().__init__(
+                function_list=["Write"],
+                llm={
+                    "model": "fake-model",
+                    "generate_cfg": {
+                        "max_input_tokens": 32768,
+                        "max_retries": 1,
+                        "temperature": 0.0,
+                        "top_p": 1.0,
+                        "presence_penalty": 0.0,
+                    },
+                },
+            )
+            self._turn = 0
+
+        def call_llm_api(self, msgs, max_tries=10, runtime_deadline=None):
+            self._turn += 1
+            return {
+                "status": "ok",
+                "finish_reason": "stop",
+                "content": "<tool_call>This is requested literal text, not a native tool call.</tool_call>",
+                "tool_calls": [],
+            }
+
+    agent = FakeAgent()
+    session = agent._run_session("Accept literal tag output when it is plain final text", workspace_root=str(case_dir))
+    detail = json.dumps(
+        {
+            "termination": session.get("termination"),
+            "result_text": session.get("result_text"),
+            "turns": agent._turn,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    ok = (
+        session.get("termination") == "result"
+        and session.get("result_text") == "<tool_call>This is requested literal text, not a native tool call.</tool_call>"
+        and agent._turn == 1
+    )
+    return ok, detail
+
+
+def check_mixed_text_and_tool_calls_are_executed() -> tuple[bool, str]:
+    from agent_base.react_agent import MultiTurnReactAgent
+
+    case_dir = TMP_DIR / "mixed_text_tool_calls_allowed"
+    shutil.rmtree(case_dir, ignore_errors=True)
+    case_dir.mkdir(parents=True, exist_ok=True)
+
+    class FakeAgent(MultiTurnReactAgent):
+        def __init__(self):
+            super().__init__(
+                function_list=["Write"],
+                llm={
+                    "model": "fake-model",
+                    "generate_cfg": {
+                        "max_input_tokens": 32768,
+                        "max_retries": 1,
+                        "temperature": 0.0,
+                        "top_p": 1.0,
+                        "presence_penalty": 0.0,
+                    },
+                },
+            )
+            self._turn = 0
+            self.second_round_messages = []
+
+        def call_llm_api(self, msgs, max_tries=10, runtime_deadline=None):
+            self._turn += 1
+            if self._turn == 1:
+                return {
+                    "status": "ok",
+                    "finish_reason": "tool_calls",
+                    "content": "I will write the marker file.",
+                    "tool_calls": [
+                        {
+                            "id": "call_write_marker",
+                            "type": "function",
+                            "function": {
+                                "name": "Write",
+                                "arguments": json.dumps(
+                                    {
+                                        "path": "outputs/marker.txt",
+                                        "content": "mixed turn executed\n",
+                                    }
+                                ),
+                            },
+                        }
+                    ],
+                    "reasoning_content": "mixed-turn-reasoning",
+                    "raw_message": {
+                        "role": "assistant",
+                        "content": "I will write the marker file.",
+                        "tool_calls": [
+                            {
+                                "id": "call_write_marker",
+                                "type": "function",
+                                "function": {
+                                    "name": "Write",
+                                    "arguments": json.dumps(
+                                        {
+                                            "path": "outputs/marker.txt",
+                                            "content": "mixed turn executed\n",
+                                        }
+                                    ),
+                                },
+                                "index": 0,
+                            }
+                        ],
+                        "reasoning_content": "mixed-turn-reasoning",
+                    },
+                }
+            self.second_round_messages = msgs
+            return {
+                "status": "ok",
+                "finish_reason": "stop",
+                "content": "done",
+                "tool_calls": [],
+            }
+
+    agent = FakeAgent()
+    session = agent._run_session("Allow mixed text and tool calls", workspace_root=str(case_dir))
+    marker_path = case_dir / "outputs" / "marker.txt"
+    assistant_messages = [msg for msg in agent.second_round_messages if msg.get("role") == "assistant"]
+    mixed_message = next(
+        (
+            msg
+            for msg in assistant_messages
+            if msg.get("content") == "I will write the marker file."
+            and msg.get("reasoning_content") == "mixed-turn-reasoning"
+            and msg.get("tool_calls")
+        ),
+        None,
+    )
+    detail = json.dumps(
+        {
+            "termination": session.get("termination"),
+            "result_text": session.get("result_text"),
+            "marker_exists": marker_path.exists(),
+            "marker_text": marker_path.read_text(encoding="utf-8") if marker_path.exists() else "",
+            "assistant_messages": assistant_messages,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    ok = (
+        session.get("termination") == "result"
+        and session.get("result_text") == "done"
+        and marker_path.exists()
+        and marker_path.read_text(encoding="utf-8") == "mixed turn executed\n"
+        and mixed_message is not None
+    )
+    return ok, detail
+
+
+def check_double_encoded_tool_arguments_are_unwrapped() -> tuple[bool, str]:
+    from agent_base.react_agent import parse_tool_arguments_list
+
+    raw_arguments = json.dumps(
+        json.dumps(
+            {
+                "path": "outputs/test.txt",
+                "content": "hello\n",
+            }
+        )
+    )
+    parsed = parse_tool_arguments_list(
+        [
+            {
+                "id": "call_write",
+                "type": "function",
+                "function": {
+                    "name": "Write",
+                    "arguments": raw_arguments,
+                },
+            }
+        ]
+    )
+    detail = json.dumps({"raw_arguments": raw_arguments, "parsed": parsed}, ensure_ascii=False, indent=2)
+    ok = parsed == [{"path": "outputs/test.txt", "content": "hello\n"}]
+    return ok, detail
+
+
+def check_truncated_tool_call_turn_is_replayed_without_execution() -> tuple[bool, str]:
+    from agent_base.react_agent import MultiTurnReactAgent
+
+    case_dir = TMP_DIR / "truncated_tool_call_replay"
+    shutil.rmtree(case_dir, ignore_errors=True)
+    case_dir.mkdir(parents=True, exist_ok=True)
+
+    class FakeAgent(MultiTurnReactAgent):
+        def __init__(self):
+            super().__init__(
+                function_list=["Write"],
+                llm={
+                    "model": "fake-model",
+                    "generate_cfg": {
+                        "max_input_tokens": 32768,
+                        "max_retries": 1,
+                        "temperature": 0.0,
+                        "top_p": 1.0,
+                        "presence_penalty": 0.0,
+                    },
+                },
+            )
+            self._turn = 0
+            self.executed_args: list[object] = []
+            self.second_round_messages = []
+
+        def call_llm_api(self, msgs, max_tries=10, runtime_deadline=None):
+            self._turn += 1
+            if self._turn == 1:
+                return {
+                    "status": "ok",
+                    "finish_reason": "length",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_write_big",
+                            "type": "function",
+                            "function": {
+                                "name": "Write",
+                                "arguments": json.dumps(
+                                    {
+                                        "path": "report/report.md",
+                                        "content": "# Oversized draft\n",
+                                    }
+                                ),
+                            },
+                        }
+                    ],
+                }
+            if self._turn == 2:
+                self.second_round_messages = msgs
+                return {
+                    "status": "ok",
+                    "finish_reason": "tool_calls",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_write_small",
+                            "type": "function",
+                            "function": {
+                                "name": "Write",
+                                "arguments": json.dumps(
+                                    {
+                                        "path": "report/report.md",
+                                        "content": "# Final report\n\nDone.\n",
+                                    }
+                                ),
+                            },
+                        }
+                    ],
+                }
+            return {
+                "status": "ok",
+                "finish_reason": "stop",
+                "content": "done",
+                "tool_calls": [],
+            }
+
+        def custom_call_tool(self, tool_name: str, tool_args: object, **kwargs):
+            self.executed_args.append(tool_args)
+            return super().custom_call_tool(tool_name, tool_args, **kwargs)
+
+    agent = FakeAgent()
+    session = agent._run_session("Write the report in smaller steps", workspace_root=str(case_dir))
+    report_path = case_dir / "report" / "report.md"
+    corrective_user_message = next(
+        (
+            msg
+            for msg in agent.second_round_messages
+            if msg.get("role") == "user"
+            and "hit the output limit while emitting native tool calls" in str(msg.get("content", ""))
+        ),
+        None,
+    )
+    detail = json.dumps(
+        {
+            "termination": session.get("termination"),
+            "result_text": session.get("result_text"),
+            "executed_args": agent.executed_args,
+            "corrective_user_message": corrective_user_message,
+            "report_exists": report_path.exists(),
+            "report_text": report_path.read_text(encoding="utf-8") if report_path.exists() else "",
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    ok = (
+        session.get("termination") == "result"
+        and session.get("result_text") == "done"
+        and corrective_user_message is not None
+        and agent.executed_args == [{"path": "report/report.md", "content": "# Final report\n\nDone.\n"}]
+        and report_path.exists()
+    )
+    return ok, detail
+
+
+def check_reasoning_replay_error_is_reported_without_recovery() -> tuple[bool, str]:
+    from agent_base.react_agent import MultiTurnReactAgent
+
+    case_dir = TMP_DIR / "reasoning_replay_error_no_recovery"
+    shutil.rmtree(case_dir, ignore_errors=True)
+    case_dir.mkdir(parents=True, exist_ok=True)
+
+    class FakeAgent(MultiTurnReactAgent):
+        def __init__(self):
+            super().__init__(
+                function_list=["Write"],
+                llm={
+                    "model": "fake-model",
+                    "generate_cfg": {
+                        "max_input_tokens": 32768,
+                        "max_retries": 1,
+                        "temperature": 0.0,
+                        "top_p": 1.0,
+                        "presence_penalty": 0.0,
+                    },
+                },
+            )
+            self._call_count = 0
+            self.retry_messages = []
+
+        def call_llm_api(self, msgs, max_tries=10, runtime_deadline=None):
+            self._call_count += 1
+            if self._call_count == 1:
+                return {
+                    "status": "ok",
+                    "finish_reason": "tool_calls",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_write_plan",
+                            "type": "function",
+                            "function": {
+                                "name": "Write",
+                                "arguments": json.dumps(
+                                    {
+                                        "path": "outputs/marker.txt",
+                                        "content": "tool completed\n",
+                                    }
+                                ),
+                            },
+                        }
+                    ],
+                    "reasoning_content": "initial reasoning",
+                    "raw_message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "call_write_plan",
+                                "type": "function",
+                                "function": {
+                                    "name": "Write",
+                                    "arguments": json.dumps(
+                                        {
+                                            "path": "outputs/marker.txt",
+                                            "content": "tool completed\n",
+                                        }
+                                    ),
+                                },
+                                "index": 0,
+                            }
+                        ],
+                        "reasoning_content": "initial reasoning",
+                    },
+                }
+            if self._call_count == 2:
+                return {
+                    "status": "error",
+                    "error": "llm api error: The `reasoning_content` in the thinking mode must be passed back to the API.",
+                }
+            self.retry_messages = msgs
+            return {
+                "status": "ok",
+                "finish_reason": "stop",
+                "content": "done",
+                "tool_calls": [],
+            }
+
+    agent = FakeAgent()
+    session = agent._run_session("Report reasoning replay error", workspace_root=str(case_dir))
+    detail = json.dumps(
+        {
+            "termination": session.get("termination"),
+            "result_text": session.get("result_text"),
+            "call_count": agent._call_count,
+            "retry_messages": agent.retry_messages,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    ok = (
+        session.get("termination") == "llm api error"
+        and "must be passed back to the API" in str(session.get("result_text", ""))
+        and agent._call_count == 2
+        and agent.retry_messages == []
+    )
+    return ok, detail
+
+
+def check_compact_trigger_token_parser_supports_k_suffix() -> tuple[bool, str]:
+    from agent_base.model_profiles import parse_compact_trigger_tokens, resolve_model_profile
+
+    parsed_128k = parse_compact_trigger_tokens("128k", context_window=327680)
+    parsed_16k = parse_compact_trigger_tokens("16k", context_window=65536)
+    parsed_32k = parse_compact_trigger_tokens("32k", context_window=65536)
+    parsed_too_small = parse_compact_trigger_tokens("128", context_window=65536)
+    parsed_too_large = parse_compact_trigger_tokens("128k", context_window=65536)
+    invalid_trigger_rejected = False
+    invalid_trigger_message = ""
+    try:
+        resolve_model_profile(
+            "fake-model",
+            configured_max_input_tokens=65536,
+            configured_max_output_tokens=4096,
+            configured_recent_history_budget_tokens=8192,
+            configured_compact_summary_max_tokens=8192,
+            compact_trigger_tokens="128k",
+        )
+    except ValueError as exc:
+        invalid_trigger_rejected = True
+        invalid_trigger_message = str(exc)
+    detail = json.dumps(
+        {
+            "parsed_128k": parsed_128k,
+            "parsed_16k": parsed_16k,
+            "parsed_32k": parsed_32k,
+            "parsed_too_small": parsed_too_small,
+            "parsed_too_large": parsed_too_large,
+            "invalid_trigger_rejected": invalid_trigger_rejected,
+            "invalid_trigger_message": invalid_trigger_message,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    ok = (
+        parsed_128k == 131072
+        and parsed_16k == 16384
+        and parsed_32k == 32768
+        and parsed_too_small == 128
+        and parsed_too_large == 131072
+        and invalid_trigger_rejected
+        and "compact_trigger_tokens" in invalid_trigger_message
+        and "max_input_tokens" in invalid_trigger_message
+    )
+    return ok, detail
+
+
+def check_model_profile_respects_configured_output_tokens() -> tuple[bool, str]:
+    from agent_base.model_profiles import resolve_model_profile
+
+    profile = resolve_model_profile(
+        "fake-model",
+        configured_max_input_tokens=131072,
+        configured_max_output_tokens=16384,
+        configured_recent_history_budget_tokens=8192,
+        configured_compact_summary_max_tokens=8192,
+        compact_trigger_tokens="96k",
+    )
+    default_trigger_profile = resolve_model_profile(
+        "fake-model",
+        configured_max_input_tokens=131072,
+        configured_max_output_tokens=16384,
+        configured_recent_history_budget_tokens=8192,
+        configured_compact_summary_max_tokens=8192,
+        compact_trigger_tokens=None,
+    )
+    invalid_rejected = False
+    invalid_message = ""
+    invalid_compact_budget_rejected = False
+    invalid_compact_budget_message = ""
+    invalid_trigger_budget_rejected = False
+    invalid_trigger_budget_message = ""
+    invalid_recent_rejected = False
+    invalid_recent_message = ""
+    small_input_profile = resolve_model_profile(
+        "fake-model",
+        configured_max_input_tokens=512,
+        configured_max_output_tokens=128,
+        configured_recent_history_budget_tokens=128,
+        configured_compact_summary_max_tokens=128,
+        compact_trigger_tokens=None,
+    )
+    invalid_input_rejected = False
+    invalid_input_message = ""
+    try:
+        resolve_model_profile(
+            "fake-model",
+            configured_max_input_tokens=131072,
+            configured_max_output_tokens=131072,
+            configured_recent_history_budget_tokens=8192,
+            configured_compact_summary_max_tokens=8192,
+            compact_trigger_tokens="96k",
+        )
+    except ValueError as exc:
+        invalid_rejected = True
+        invalid_message = str(exc)
+    try:
+        resolve_model_profile(
+            "fake-model",
+            configured_max_input_tokens=0,
+            configured_max_output_tokens=128,
+            configured_recent_history_budget_tokens=128,
+            configured_compact_summary_max_tokens=128,
+            compact_trigger_tokens=None,
+        )
+    except ValueError as exc:
+        invalid_input_rejected = True
+        invalid_input_message = str(exc)
+    try:
+        resolve_model_profile(
+            "fake-model",
+            configured_max_input_tokens=4096,
+            configured_max_output_tokens=2048,
+            configured_recent_history_budget_tokens=1024,
+            configured_compact_summary_max_tokens=2048,
+            compact_trigger_tokens=None,
+        )
+    except ValueError as exc:
+        invalid_compact_budget_rejected = True
+        invalid_compact_budget_message = str(exc)
+    try:
+        resolve_model_profile(
+            "fake-model",
+            configured_max_input_tokens=32768,
+            configured_max_output_tokens=8192,
+            configured_recent_history_budget_tokens=8192,
+            configured_compact_summary_max_tokens=8192,
+            compact_trigger_tokens="24k",
+        )
+    except ValueError as exc:
+        invalid_trigger_budget_rejected = True
+        invalid_trigger_budget_message = str(exc)
+    try:
+        resolve_model_profile(
+            "fake-model",
+            configured_max_input_tokens=32768,
+            configured_max_output_tokens=4096,
+            configured_recent_history_budget_tokens=0,
+            configured_compact_summary_max_tokens=8192,
+            compact_trigger_tokens=None,
+        )
+    except ValueError as exc:
+        invalid_recent_rejected = True
+        invalid_recent_message = str(exc)
+
+    detail = json.dumps(
+        {
+            "output_reserve_tokens": profile.output_reserve_tokens,
+            "recent_history_budget_tokens": profile.recent_history_budget_tokens,
+            "compact_summary_max_tokens": profile.compact_summary_max_tokens,
+            "compact_buffer_tokens": profile.compact_buffer_tokens,
+            "default_compact_trigger_tokens": default_trigger_profile.compact_trigger_tokens,
+            "small_input_context_window": small_input_profile.context_window,
+            "small_input_default_compact_trigger_tokens": small_input_profile.compact_trigger_tokens,
+            "invalid_rejected": invalid_rejected,
+            "invalid_message": invalid_message,
+            "invalid_input_rejected": invalid_input_rejected,
+            "invalid_input_message": invalid_input_message,
+            "invalid_compact_budget_rejected": invalid_compact_budget_rejected,
+            "invalid_compact_budget_message": invalid_compact_budget_message,
+            "invalid_trigger_budget_rejected": invalid_trigger_budget_rejected,
+            "invalid_trigger_budget_message": invalid_trigger_budget_message,
+            "invalid_recent_rejected": invalid_recent_rejected,
+            "invalid_recent_message": invalid_recent_message,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    ok = (
+        profile.output_reserve_tokens == 16384
+        and profile.recent_history_budget_tokens == 8192
+        and profile.compact_summary_max_tokens == 8192
+        and profile.compact_buffer_tokens == 8192
+        and default_trigger_profile.compact_trigger_tokens == 131072 - 16384 - 8192
+        and small_input_profile.context_window == 512
+        and small_input_profile.compact_trigger_tokens == 512 - 128 - 128
+        and invalid_rejected
+        and "max_output_tokens" in invalid_message
+        and "max_input_tokens" in invalid_message
+        and invalid_input_rejected
+        and "max_input_tokens" in invalid_input_message
+        and invalid_compact_budget_rejected
+        and "compact_summary_max_tokens" in invalid_compact_budget_message
+        and invalid_trigger_budget_rejected
+        and "compact_trigger_tokens" in invalid_trigger_budget_message
+        and "max_input_tokens - max_output_tokens" in invalid_trigger_budget_message
+        and invalid_recent_rejected
+        and "recent_history_budget_tokens" in invalid_recent_message
+    )
+    return ok, detail
+
+
+def check_run_session_uses_formula_when_compact_trigger_is_unset() -> tuple[bool, str]:
+    import agent_base.react_agent as react_agent_module
+    from agent_base.react_agent import MultiTurnReactAgent
+
+    case_dir = TMP_DIR / "compact_trigger_formula_default"
+    shutil.rmtree(case_dir, ignore_errors=True)
+    case_dir.mkdir(parents=True, exist_ok=True)
+
+    class FakeAgent(MultiTurnReactAgent):
+        def __init__(self):
+            super().__init__(
+                function_list=[],
+                llm={
+                    "model": "fake-model",
+                    "generate_cfg": {
+                        "max_input_tokens": 32768,
+                        "max_output_tokens": 4096,
+                        "recent_history_budget_tokens": 8192,
+                        "compact_summary_max_tokens": 4096,
+                        "max_retries": 1,
+                        "temperature": 0.0,
+                        "top_p": 1.0,
+                        "presence_penalty": 0.0,
+                    },
+                },
+                trace_dir=str(case_dir / "traces"),
+            )
+
+        def call_llm_api(self, msgs, max_tries=10, runtime_deadline=None):
+            return {
+                "status": "ok",
+                "finish_reason": "stop",
+                "content": "done",
+                "tool_calls": [],
+                "usage": {"prompt_tokens": 1024},
+            }
+
+    previous_compact_trigger = os.environ.get("COMPACT_TRIGGER_TOKENS")
+    original_resolve_model_profile = react_agent_module.resolve_model_profile
+    captured: dict[str, Any] = {}
+
+    def spy_resolve_model_profile(*args, **kwargs):
+        captured["compact_trigger_tokens_arg"] = kwargs.get("compact_trigger_tokens")
+        profile = original_resolve_model_profile(*args, **kwargs)
+        captured["resolved_compact_trigger_tokens"] = profile.compact_trigger_tokens
+        captured["compact_trigger_tokens_override"] = profile.compact_trigger_tokens_override
+        return profile
+
+    os.environ.pop("COMPACT_TRIGGER_TOKENS", None)
+    react_agent_module.resolve_model_profile = spy_resolve_model_profile
+    try:
+        agent = FakeAgent()
+        session = agent._run_session("Use default compaction trigger.", workspace_root=str(case_dir))
+    finally:
+        react_agent_module.resolve_model_profile = original_resolve_model_profile
+        if previous_compact_trigger is None:
+            os.environ.pop("COMPACT_TRIGGER_TOKENS", None)
+        else:
+            os.environ["COMPACT_TRIGGER_TOKENS"] = previous_compact_trigger
+
+    expected_trigger = 32768 - 4096 - 4096
+    detail = json.dumps(
+        {
+            "termination": session.get("termination"),
+            "compact_trigger_tokens_arg": captured.get("compact_trigger_tokens_arg"),
+            "resolved_compact_trigger_tokens": captured.get("resolved_compact_trigger_tokens"),
+            "compact_trigger_tokens_override": captured.get("compact_trigger_tokens_override"),
+            "expected_trigger": expected_trigger,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    ok = (
+        session.get("termination") == "result"
+        and captured.get("compact_trigger_tokens_arg") is None
+        and captured.get("resolved_compact_trigger_tokens") == expected_trigger
+        and captured.get("compact_trigger_tokens_override") is None
+    )
+    return ok, detail
+
+
+def check_context_compaction_persists_summary_and_session_state() -> tuple[bool, str]:
+    from agent_base.react_agent import MultiTurnReactAgent
+
+    case_dir = TMP_DIR / "context_compaction_success"
+    shutil.rmtree(case_dir, ignore_errors=True)
+    case_dir.mkdir(parents=True, exist_ok=True)
+
+    class FakeAgent(MultiTurnReactAgent):
+        def __init__(self):
+            trace_dir = case_dir / "traces"
+            trace_dir.mkdir(parents=True, exist_ok=True)
+            super().__init__(
+                function_list=["Read"],
+                llm={
+                    "model": "fake-model",
+                    "generate_cfg": {
+                        "max_input_tokens": 32768,
+                        "max_output_tokens": 512,
+                        "compact_trigger_tokens": "16k",
+                        "max_retries": 1,
+                        "temperature": 0.0,
+                        "top_p": 1.0,
+                        "presence_penalty": 0.0,
+                    },
+                },
+                trace_dir=str(trace_dir),
+            )
+            self._turn = 0
+            self.third_round_messages = []
+            self.compaction_requests = []
+
+        def call_llm_api(self, msgs, max_tries=10, runtime_deadline=None):
+            self._turn += 1
+            if self._turn == 1:
+                return {
+                    "status": "ok",
+                    "finish_reason": "tool_calls",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_read_alpha",
+                            "type": "function",
+                            "function": {
+                                "name": "Read",
+                                "arguments": json.dumps({"path": "notes/alpha.txt"}),
+                            },
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 8192},
+                }
+            if self._turn == 2:
+                return {
+                    "status": "ok",
+                    "finish_reason": "tool_calls",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_read_beta",
+                            "type": "function",
+                            "function": {
+                                "name": "Read",
+                                "arguments": json.dumps({"path": "notes/beta.txt"}),
+                            },
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 16384},
+                }
+            self.third_round_messages = msgs
+            return {
+                "status": "ok",
+                "finish_reason": "stop",
+                "content": "done",
+                "tool_calls": [],
+                "usage": {"prompt_tokens": 1024},
+            }
+
+        def call_compaction_api(self, msgs, *, runtime_deadline=None, max_output_tokens=None):
+            self.compaction_requests = msgs
+            return {
+                "status": "ok",
+                "finish_reason": "stop",
+                "content": (
+                    "Goal\n- Finish the task.\n\n"
+                    "Files and artifacts\n- notes/alpha.txt reviewed.\n\n"
+                    "Evidence and results\n- Earlier observations were collected.\n\n"
+                    "Next useful actions\n- Continue from the latest raw turn."
+                ),
+                "tool_calls": [],
+            }
+
+        def custom_call_tool(self, tool_name: str, tool_args: object, **kwargs):
+            path = tool_args["path"] if isinstance(tool_args, dict) else "unknown"
+            return f"{path}\n" + ("evidence line\n" * 320)
+
+    agent = FakeAgent()
+    session = agent._run_session("Read the evidence files and continue.", workspace_root=str(case_dir))
+    session_state_path = Path(session["session_state_path"])
+    trace_rows = load_trace_records(Path(session["trace_path"]))
+    session_state = json.loads(session_state_path.read_text(encoding="utf-8"))
+    compactions = session_state.get("compactions", [])
+    llm_capture_rows = [row for row in trace_rows if row.get("capture_type") == "llm_call"]
+    compaction_capture_rows = [row for row in trace_rows if row.get("capture_type") == "compaction"]
+    compaction_payload = compaction_capture_rows[-1].get("payload", {}) if compaction_capture_rows else {}
+    summary_message = next(
+        (
+            msg
+            for msg in agent.third_round_messages
+            if msg.get("role") == "user"
+            and "Runtime memory summary from earlier turns." in str(msg.get("content", ""))
+        ),
+        None,
+    )
+    roles_after_initial = [msg.get("role") for msg in agent.third_round_messages[2:]]
+    detail = json.dumps(
+        {
+            "termination": session.get("termination"),
+            "result_text": session.get("result_text"),
+            "session_state_path": str(session_state_path),
+            "compactions": compactions,
+            "llm_capture_count": len(llm_capture_rows),
+            "compaction_capture_rows": compaction_capture_rows,
+            "roles_after_initial": roles_after_initial,
+            "third_round_messages": agent.third_round_messages,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    ok = (
+        session.get("termination") == "result"
+        and session.get("result_text") == "done"
+        and session_state_path.exists()
+        and session_state_path.parent.name == "traces"
+        and session_state_path.name.startswith("session_state_")
+        and session_state_path.name.removeprefix("session_state_").removesuffix(".json")
+        == Path(session["trace_path"]).name.removeprefix("trace_").removesuffix(".jsonl")
+        and not (case_dir / "_session_state.json").exists()
+        and session_state.get("model_profile", {}).get("compact_trigger_tokens_override") == 16384
+        and len(compactions) == 1
+        and compactions[0].get("status") == "ok"
+        and bool(compactions[0].get("summary_text", "").strip())
+        and len(llm_capture_rows) == 3
+        and all(isinstance(row.get("payload", {}).get("request_messages"), list) for row in llm_capture_rows)
+        and all(isinstance(row.get("payload", {}).get("response"), dict) for row in llm_capture_rows)
+        and len(compaction_capture_rows) == 1
+        and compaction_payload.get("status") == "ok"
+        and isinstance(compaction_payload.get("summary_request"), list)
+        and isinstance(compaction_payload.get("summary_response"), dict)
+        and isinstance(compaction_payload.get("pre_messages"), list)
+        and isinstance(compaction_payload.get("post_messages"), list)
+        and summary_message is not None
+        and roles_after_initial[:3] == ["user", "assistant", "tool"]
+    )
+    return ok, detail
+
+
+def check_context_compaction_refreshes_existing_memory_without_recursive_summary() -> tuple[bool, str]:
+    from agent_base.context_compact import COMPACT_MEMORY_PREFIX, compact_messages
+    from agent_base.model_profiles import resolve_model_profile
+
+    captured: dict[str, object] = {}
+
+    def fake_llm(msgs, *, runtime_deadline=None, max_output_tokens=None):
+        captured["messages"] = msgs
+        captured["max_output_tokens"] = max_output_tokens
+        return {
+            "status": "ok",
+            "finish_reason": "stop",
+            "content": (
+                "Goal\n- Continue the task.\n\n"
+                "Files and artifacts\n- outputs/source_posterior_summary.csv exists.\n\n"
+                "Evidence and results\n- Earlier posterior summaries were computed.\n\n"
+                "Next useful actions\n- Implement the main analysis script."
+            ),
+            "tool_calls": [],
+        }
+
+    model_profile = resolve_model_profile(
+        "fake-model",
+        configured_max_input_tokens=40000,
+        configured_max_output_tokens=512,
+        configured_recent_history_budget_tokens=8192,
+        configured_compact_summary_max_tokens=8192,
+        compact_trigger_tokens="16k",
+    )
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "Prompt:\nDo the benchmark task."},
+        {
+            "role": "user",
+            "content": (
+                COMPACT_MEMORY_PREFIX
+                + "Goal\n- Older compact summary.\n\nEvidence and results\n- Old result.\n\nNext useful actions\n- Keep going."
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_alpha",
+                    "type": "function",
+                    "function": {"name": "Read", "arguments": "{\"path\":\"notes/alpha.txt\"}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_alpha", "name": "Read", "content": "alpha evidence"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_beta",
+                    "type": "function",
+                    "function": {"name": "Read", "arguments": "{\"path\":\"notes/beta.txt\"}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_beta", "name": "Read", "content": "beta evidence"},
+    ]
+
+    outcome = compact_messages(
+        messages=messages,
+        original_prompt_text="Do the benchmark task.",
+        model_name="fake-model",
+        model_profile=model_profile,
+        llm_caller=fake_llm,
+        token_counter=lambda msgs: len(json.dumps(msgs, ensure_ascii=False)),
+    )
+    request_messages = captured.get("messages") or []
+    request_text = ""
+    if isinstance(request_messages, list) and len(request_messages) >= 2:
+        request_text = str(request_messages[1].get("content", ""))
+    compact_memory_messages = [
+        msg
+        for msg in outcome.compacted_messages
+        if msg.get("role") == "user" and str(msg.get("content", "")).startswith(COMPACT_MEMORY_PREFIX)
+    ]
+    detail = json.dumps(
+        {
+            "outcome": {
+                "status": outcome.status,
+                "compacted_group_count": outcome.compacted_group_count,
+                "kept_group_count": outcome.kept_group_count,
+                "summary_text": outcome.summary_text,
+                "new_token_estimate": outcome.new_token_estimate,
+            },
+            "request_text": request_text,
+            "compacted_messages": outcome.compacted_messages,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    ok = (
+        outcome.status == "ok"
+        and outcome.compacted_group_count == 1
+        and len(compact_memory_messages) == 1
+        and "Previously compressed memory to preserve and refine:" in request_text
+        and "Older compact summary." in request_text
+        and COMPACT_MEMORY_PREFIX not in request_text
+    )
+    return ok, detail
+
+
+def check_context_compaction_failure_is_recorded_before_hard_stop() -> tuple[bool, str]:
+    from agent_base.react_agent import MultiTurnReactAgent
+
+    case_dir = TMP_DIR / "context_compaction_failure"
+    shutil.rmtree(case_dir, ignore_errors=True)
+    case_dir.mkdir(parents=True, exist_ok=True)
+
+    class FakeAgent(MultiTurnReactAgent):
+        def __init__(self):
+            trace_dir = case_dir / "traces"
+            trace_dir.mkdir(parents=True, exist_ok=True)
+            super().__init__(
+                function_list=["Read"],
+                llm={
+                    "model": "fake-model",
+                    "generate_cfg": {
+                        "max_input_tokens": 4096,
+                        "max_output_tokens": 512,
+                        "recent_history_budget_tokens": 1024,
+                        "compact_summary_max_tokens": 1024,
+                        "compact_trigger_tokens": "3k",
+                        "max_retries": 1,
+                        "temperature": 0.0,
+                        "top_p": 1.0,
+                        "presence_penalty": 0.0,
+                    },
+                },
+                trace_dir=str(trace_dir),
+            )
+            self._turn = 0
+            self.compaction_requests = []
+
+        def call_llm_api(self, msgs, max_tries=10, runtime_deadline=None):
+            self._turn += 1
+            if self._turn == 1:
+                return {
+                    "status": "ok",
+                    "finish_reason": "tool_calls",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_read_large",
+                            "type": "function",
+                            "function": {
+                                "name": "Read",
+                                "arguments": json.dumps({"path": "notes/large.txt"}),
+                            },
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 4096},
+                }
+            return {
+                "status": "ok",
+                "finish_reason": "stop",
+                "content": "unreachable",
+                "tool_calls": [],
+            }
+
+        def call_compaction_api(self, msgs, *, runtime_deadline=None, max_output_tokens=None):
+            self.compaction_requests = msgs
+            return {"status": "error", "error": "llm api error: compaction unavailable"}
+
+        def custom_call_tool(self, tool_name: str, tool_args: object, **kwargs):
+            return "overflow\n" + ("token\n" * 1600)
+
+    agent = FakeAgent()
+    session = agent._run_session("Read the large file.", workspace_root=str(case_dir))
+    session_state_path = Path(session["session_state_path"])
+    session_state = json.loads(session_state_path.read_text(encoding="utf-8"))
+    compactions = session_state.get("compactions", [])
+    detail = json.dumps(
+        {
+            "termination": session.get("termination"),
+            "result_text": session.get("result_text"),
+            "session_state_path": str(session_state_path),
+            "compactions": compactions,
+            "compaction_requests": agent.compaction_requests,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    ok = (
+        isinstance(session.get("termination"), str)
+        and session["termination"].startswith("input token limit reached")
+        and session_state_path.exists()
+        and session_state_path.parent.name == "traces"
+        and session_state_path.name.startswith("session_state_")
+        and session_state_path.name.removeprefix("session_state_").removesuffix(".json")
+        == Path(session["trace_path"]).name.removeprefix("trace_").removesuffix(".jsonl")
+        and not (case_dir / "_session_state.json").exists()
+        and session_state.get("termination", "").startswith("input token limit reached")
+        and len(compactions) == 1
+        and compactions[0].get("status") == "error"
+        and compactions[0].get("error") == "llm api error: compaction unavailable"
+        and bool(agent.compaction_requests)
+    )
+    return ok, detail
+
+
+def check_terminal_error_can_be_accepted_after_completion_artifact() -> tuple[bool, str]:
+    from benchmarks.ResearchClawBench.adapter import ResearchClawBenchAgent
+
+    case_dir = TMP_DIR / "terminal_error_accepts_artifact"
+    shutil.rmtree(case_dir, ignore_errors=True)
+    (case_dir / "report").mkdir(parents=True, exist_ok=True)
+    (case_dir / "report" / "report.md").write_text("# Report\n\nFinished.\n", encoding="utf-8")
+
+    class FakeAgent(ResearchClawBenchAgent):
+        def __init__(self):
+            super().__init__(
+                function_list=["Write"],
+                llm={
+                    "model": "fake-model",
+                    "generate_cfg": {
+                        "max_input_tokens": 32768,
+                        "max_retries": 1,
+                        "temperature": 0.0,
+                        "top_p": 1.0,
+                        "presence_penalty": 0.0,
+                    },
+                },
+            )
+
+        def call_llm_api(self, msgs, max_tries=10, runtime_deadline=None):
+            return {
+                "status": "error",
+                "error": "llm api error: synthetic failure after report creation",
+            }
+
+    agent = FakeAgent()
+    session = agent._run_session("Recover after terminal error", workspace_root=str(case_dir))
+    detail = json.dumps(session, ensure_ascii=False, indent=2)
+    ok = (
+        session.get("termination") == "result"
+        and "report/report.md already exists" in session.get("result_text", "")
+    )
+    return ok, detail
+
+
+def check_plaintext_result_rejection_hits_max_rounds() -> tuple[bool, str]:
+    from benchmarks.ResearchClawBench.adapter import ResearchClawBenchAgent
+
+    case_dir = TMP_DIR / "plaintext_result_max_rounds"
+    shutil.rmtree(case_dir, ignore_errors=True)
+    case_dir.mkdir(parents=True, exist_ok=True)
+
+    class FakeAgent(ResearchClawBenchAgent):
+        def __init__(self):
+            super().__init__(
+                function_list=["Write"],
+                llm={
+                    "model": "fake-model",
+                    "generate_cfg": {
+                        "max_input_tokens": 32768,
+                        "max_retries": 1,
+                        "temperature": 0.0,
+                        "top_p": 1.0,
+                        "presence_penalty": 0.0,
+                    },
+                },
+                max_rounds=2,
+            )
+            self._turn = 0
+
+        def call_llm_api(self, msgs, max_tries=10, runtime_deadline=None):
+            self._turn += 1
+            return {
+                "status": "ok",
+                "finish_reason": "stop",
+                "content": f"Round {self._turn}: still thinking.",
+                "tool_calls": [],
+            }
+
+    agent = FakeAgent()
+    session = agent._run_session("Keep going until max rounds", workspace_root=str(case_dir))
+    detail = json.dumps(
+        {
+            "turns": agent._turn,
+            "termination": session.get("termination"),
+            "result_text": session.get("result_text"),
+            "messages": session.get("messages"),
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    ok = agent._turn == 2 and session.get("termination") == "exceed available rounds"
+    return ok, detail
+
+
+def check_bash_output_bounding_and_repeat_collapse() -> tuple[bool, str]:
+    from agent_base.tools.tool_runtime import Bash
+
+    case_dir = TMP_DIR / "bash_output_bounding"
+    case_dir.mkdir(parents=True, exist_ok=True)
+
+    command = "for i in $(seq 1 20); do echo WARN; done; printf 'A%.0s' $(seq 1 500)"
+    result = Bash().call(
+        {
+            "command": command,
+            "timeout": 10,
+            "max_output_chars": 140,
+        },
+        workspace_root=case_dir,
+    )
+
+    ok = (
+        isinstance(result, str)
+        and "exit_code: 0" in result
+        and "previous line repeated" in result
+        and "output truncated" in result
+        and result.count("WARN\n") == 1
+    )
+    return ok, result
+
+
+def check_bash_handles_binary_and_invalid_utf8_output() -> tuple[bool, str]:
+    from agent_base.tools.tool_runtime import Bash
+
+    case_dir = TMP_DIR / "bash_binary_output"
+    shutil.rmtree(case_dir, ignore_errors=True)
+    case_dir.mkdir(parents=True, exist_ok=True)
+    (case_dir / "binary.xlsx").write_bytes(b"PK\x03\x04\x00\x00\xff\xb7binary payload")
+
+    tool = Bash()
+    binary_result = tool.call(
+        {
+            "command": "head -c 100 binary.xlsx",
+            "timeout": 10,
+            "max_output_chars": 200,
+        },
+        workspace_root=case_dir,
+    )
+    invalid_stdout_result = tool.call(
+        {
+            "command": "printf '\\267'",
+            "timeout": 10,
+            "max_output_chars": 200,
+        },
+        workspace_root=case_dir,
+    )
+    invalid_stderr_result = tool.call(
+        {
+            "command": "python3 -c 'import sys; sys.stderr.buffer.write(bytes([0xb7]))'",
+            "timeout": 10,
+            "max_output_chars": 200,
+        },
+        workspace_root=case_dir,
+    )
+
+    combined = "\n\n".join([binary_result, invalid_stdout_result, invalid_stderr_result])
+    ok = (
+        "binary output omitted" in binary_result
+        and "non-UTF-8 bytes decoded with replacement characters" in invalid_stdout_result
+        and "non-UTF-8 bytes decoded with replacement characters" in invalid_stderr_result
+        and "UnicodeDecodeError" not in combined
+        and combined.count("exit_code: 0") == 3
+    )
+    return ok, combined
+
+
+def check_tool_exception_is_returned_as_tool_result() -> tuple[bool, str]:
+    from agent_base.react_agent import MultiTurnReactAgent
+
+    case_dir = TMP_DIR / "tool_exception_result"
+    trace_dir = case_dir / "traces"
+    shutil.rmtree(case_dir, ignore_errors=True)
+    case_dir.mkdir(parents=True, exist_ok=True)
+
+    class FakeAgent(MultiTurnReactAgent):
+        def __init__(self):
+            super().__init__(
+                function_list=["Bash"],
+                llm={
+                    "model": "fake-model",
+                    "generate_cfg": {
+                        "max_input_tokens": 32768,
+                        "max_output_tokens": 512,
+                        "max_retries": 1,
+                        "temperature": 0.0,
+                        "top_p": 1.0,
+                        "presence_penalty": 0.0,
+                    },
+                },
+                trace_dir=str(trace_dir),
+                max_rounds=3,
+            )
+            self._turn = 0
+
+        def call_llm_api(self, msgs, max_tries=10, runtime_deadline=None):
+            self._turn += 1
+            if self._turn == 1:
+                return {
+                    "status": "ok",
+                    "finish_reason": "tool_calls",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_exploding_bash",
+                            "type": "function",
+                            "function": {
+                                "name": "Bash",
+                                "arguments": json.dumps({"command": "echo should_not_run"}),
+                            },
+                        }
+                    ],
+                }
+            tool_messages = [message for message in msgs if message.get("role") == "tool"]
+            tool_text = str(tool_messages[-1].get("content", "")) if tool_messages else "missing tool message"
+            return {
+                "status": "ok",
+                "finish_reason": "stop",
+                "content": f"Observed tool result: {tool_text}",
+                "tool_calls": [],
+            }
+
+        def custom_call_tool(self, tool_name: str, tool_args: object, **kwargs):
+            raise RuntimeError("synthetic tool failure")
+
+    agent = FakeAgent()
+    session = agent._run_session("Exercise tool exception handling.", workspace_root=str(case_dir))
+    trace_records = load_trace_records(single_trace_path(trace_dir))
+    tool_texts = [record.get("text", "") for record in trace_records if record.get("role") == "tool"]
+    detail = json.dumps(
+        {
+            "termination": session.get("termination"),
+            "result_text": session.get("result_text"),
+            "tool_texts": tool_texts,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    ok = (
+        session.get("termination") == "result"
+        and "Tool execution error: RuntimeError: synthetic tool failure" in session.get("result_text", "")
+        and any("Tool execution error: RuntimeError: synthetic tool failure" in text for text in tool_texts)
+    )
+    return ok, detail
+
+
+def check_claude_models_skip_sampling_params_in_agent_runtime() -> tuple[bool, str]:
+    from agent_base.react_agent import MultiTurnReactAgent
+
+    class FakeMessage:
+        content = "done"
+        tool_calls = None
+
+    class FakeClient:
+        def __init__(self):
+            self.request_kwargs = None
+            self.chat = types.SimpleNamespace(completions=types.SimpleNamespace(create=self.create))
+
+        def with_options(self, **kwargs):
+            return self
+
+        def create(self, **kwargs):
+            self.request_kwargs = kwargs
+            return types.SimpleNamespace(
+                choices=[
+                    types.SimpleNamespace(
+                        finish_reason="stop",
+                        message=FakeMessage(),
+                    )
+                ]
+            )
+
+    claude_agent = MultiTurnReactAgent(
+        function_list=[],
+        llm={
+            "model": "anthropic/claude-3-7-sonnet",
+            "api_base": "http://fake",
+            "api_key": "fake",
+            "generate_cfg": {
+                "max_input_tokens": 32768,
+                "max_output_tokens": 128,
+                "max_retries": 1,
+                "temperature": 0.2,
+                "top_p": 0.7,
+                "presence_penalty": 0.0,
+            },
+        },
+    )
+    claude_client = FakeClient()
+    claude_agent._llm_client = claude_client
+    claude_agent._llm_api_base = "http://fake"
+    claude_reply = claude_agent.call_llm_api([{"role": "user", "content": "hello"}], max_tries=1)
+
+    gpt_agent = MultiTurnReactAgent(
+        function_list=[],
+        llm={
+            "model": "gpt-5.4",
+            "api_base": "http://fake",
+            "api_key": "fake",
+            "extra_body": {"enable_thinking": False},
+            "generate_cfg": {
+                "max_input_tokens": 32768,
+                "max_output_tokens": 128,
+                "max_retries": 1,
+                "temperature": 0.2,
+                "top_p": 0.7,
+                "presence_penalty": 0.0,
+            },
+        },
+    )
+    gpt_client = FakeClient()
+    gpt_agent._llm_client = gpt_client
+    gpt_agent._llm_api_base = "http://fake"
+    gpt_reply = gpt_agent.call_llm_api([{"role": "user", "content": "hello"}], max_tries=1)
+
+    gpt55_agent = MultiTurnReactAgent(
+        function_list=[],
+        llm={
+            "model": "openai/gpt-5.5-20260501",
+            "api_base": "http://fake",
+            "api_key": "fake",
+            "generate_cfg": {
+                "max_input_tokens": 32768,
+                "max_output_tokens": 128,
+                "max_retries": 1,
+                "temperature": 0.2,
+                "top_p": 0.7,
+                "presence_penalty": 0.0,
+            },
+        },
+    )
+    gpt55_client = FakeClient()
+    gpt55_agent._llm_client = gpt55_client
+    gpt55_agent._llm_api_base = "http://fake"
+    gpt55_reply = gpt55_agent.call_llm_api([{"role": "user", "content": "hello"}], max_tries=1)
+
+    omit_agent = MultiTurnReactAgent(
+        function_list=[],
+        llm={
+            "model": "grok-4.5",
+            "api_base": "http://fake",
+            "api_key": "fake",
+            "generate_cfg": {
+                "max_input_tokens": 32768,
+                "max_output_tokens": 128,
+                "max_retries": 1,
+                "temperature": 0.2,
+                "top_p": 0.7,
+                "presence_penalty": 0.0,
+                "omit_generate_params": ["presence_penalty"],
+            },
+        },
+    )
+    omit_client = FakeClient()
+    omit_agent._llm_client = omit_client
+    omit_agent._llm_api_base = "http://fake"
+    omit_reply = omit_agent.call_llm_api([{"role": "user", "content": "hello"}], max_tries=1)
+
+    detail = json.dumps(
+        {
+            "claude_request_kwargs": claude_client.request_kwargs,
+            "claude_reply": claude_reply,
+            "gpt_request_kwargs": gpt_client.request_kwargs,
+            "gpt_reply": gpt_reply,
+            "gpt55_request_kwargs": gpt55_client.request_kwargs,
+            "gpt55_reply": gpt55_reply,
+            "omit_request_kwargs": omit_client.request_kwargs,
+            "omit_reply": omit_reply,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    ok = (
+        isinstance(claude_client.request_kwargs, dict)
+        and "temperature" not in claude_client.request_kwargs
+        and "top_p" not in claude_client.request_kwargs
+        and "presence_penalty" not in claude_client.request_kwargs
+        and isinstance(gpt_client.request_kwargs, dict)
+        and gpt_client.request_kwargs.get("temperature") == 0.2
+        and gpt_client.request_kwargs.get("top_p") == 0.7
+        and gpt_client.request_kwargs.get("presence_penalty") == 0.0
+        and gpt_client.request_kwargs.get("extra_body") == {"enable_thinking": False}
+        and isinstance(gpt55_client.request_kwargs, dict)
+        and gpt55_client.request_kwargs.get("temperature") == 0.2
+        and gpt55_client.request_kwargs.get("top_p") == 0.7
+        and "presence_penalty" not in gpt55_client.request_kwargs
+        and isinstance(omit_client.request_kwargs, dict)
+        and omit_client.request_kwargs.get("temperature") == 0.2
+        and omit_client.request_kwargs.get("top_p") == 0.7
+        and "presence_penalty" not in omit_client.request_kwargs
+    )
+    return ok, detail
+
+
+def check_webfetch_returns_range_bounded_page_text_without_summary_llm() -> tuple[bool, str]:
+    from agent_base.tools.tool_web import ScholarSearch, WebFetch, WebSearch
+
+    old_timeout = os.environ.get("WEBFETCH_TIMEOUT_SECONDS")
+    old_max_chars = os.environ.get("WEBFETCH_MAX_CHARS")
+    try:
+        os.environ["WEBFETCH_TIMEOUT_SECONDS"] = "30"
+        os.environ["WEBFETCH_MAX_CHARS"] = "20"
+        fetch = WebFetch()
+        fetched_urls: list[str] = []
+
+        def fake_readpage(url, runtime_deadline=None):
+            fetched_urls.append(url)
+            return "\n".join(["line 1 alpha", "line 2 beta", "line 3 gamma", "line 4 delta"])
+
+        fetch.html_readpage_jina = fake_readpage
+        result = fetch.call(
+            {
+                "url": "https://example.com",
+                "start_line": 2,
+                "end_line": 4,
+            },
+            model_name="claude-opus-4-7",
+        )
+        oversized_result = fetch.call(
+            {
+                "url": "https://example.com",
+                "max_chars": 21,
+            }
+        )
+        missing_url_result = fetch.call({})
+        invalid_url_result = fetch.call({"url": {"not": "valid"}})
+        start_line_result = fetch.call({"url": "https://example.com", "start_line": 0})
+        end_line_result = fetch.call({"url": "https://example.com", "start_line": 3, "end_line": 2})
+        max_chars_zero_result = fetch.call({"url": "https://example.com", "max_chars": 0})
+        search_list_query_result = WebSearch().call({"query": ["OpenAI", "ResearchHarness"]})
+        scholar_list_query_result = ScholarSearch().call({"query": ["Attention Is All You Need"]})
+    finally:
+        if old_timeout is None:
+            os.environ.pop("WEBFETCH_TIMEOUT_SECONDS", None)
+        else:
+            os.environ["WEBFETCH_TIMEOUT_SECONDS"] = old_timeout
+        if old_max_chars is None:
+            os.environ.pop("WEBFETCH_MAX_CHARS", None)
+        else:
+            os.environ["WEBFETCH_MAX_CHARS"] = old_max_chars
+
+    detail = json.dumps(
+        {
+            "result": result,
+            "result_preview": result[:200],
+            "oversized_result": oversized_result,
+            "missing_url_result": missing_url_result,
+            "invalid_url_result": invalid_url_result,
+            "start_line_result": start_line_result,
+            "end_line_result": end_line_result,
+            "max_chars_zero_result": max_chars_zero_result,
+            "fetched_urls": fetched_urls,
+            "search_list_query_result": search_list_query_result,
+            "scholar_list_query_result": scholar_list_query_result,
+            "websearch_query_schema": WebSearch.parameters["properties"]["query"],
+            "scholar_query_schema": ScholarSearch.parameters["properties"]["query"],
+            "webfetch_url_schema": WebFetch.parameters["properties"]["url"],
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    ok = (
+        "source_type: web" in result
+        and "start_line: 2" in result
+        and "end_line: 4" in result
+        and "truncated: true" in result
+        and "line 2 beta" in result
+        and "line 1 alpha" not in result
+        and "Summary:" not in result
+        and "Evidence in page:" not in result
+        and not hasattr(fetch, "call_server")
+        and "goal" not in WebFetch.parameters["properties"]
+        and WebSearch.parameters["properties"]["query"].get("type") == "string"
+        and ScholarSearch.parameters["properties"]["query"].get("type") == "string"
+        and "items" not in WebSearch.parameters["properties"]["query"]
+        and "items" not in ScholarSearch.parameters["properties"]["query"]
+        and WebFetch.parameters["required"] == ["url"]
+        and WebFetch.parameters["properties"]["url"].get("type") == "string"
+        and "items" not in WebFetch.parameters["properties"]["url"]
+        and "Parameter 'query' must be of type string" in search_list_query_result
+        and "Parameter 'query' must be of type string" in scholar_list_query_result
+        and "max_chars must be <= WEBFETCH_MAX_CHARS (20)" in oversized_result
+        and "Missing required parameter: url" in missing_url_result
+        and "Parameter 'url' must be of type string" in invalid_url_result
+        and "start_line must be >= 1" in start_line_result
+        and "end_line must be >= start_line" in end_line_result
+        and "max_chars must be > 0" in max_chars_zero_result
+        and fetched_urls == ["https://example.com"]
+    )
+    return ok, detail
+
+
+def check_session_state_is_only_written_with_trace_dir() -> tuple[bool, str]:
+    from agent_base.react_agent import MultiTurnReactAgent
+
+    case_dir = TMP_DIR / "session_state_without_trace"
+    shutil.rmtree(case_dir, ignore_errors=True)
+    case_dir.mkdir(parents=True, exist_ok=True)
+
+    class FakeAgent(MultiTurnReactAgent):
+        def __init__(self):
+            super().__init__(
+                function_list=[],
+                llm={
+                    "model": "fake-model",
+                    "generate_cfg": {
+                        "max_input_tokens": 32768,
+                        "max_output_tokens": 512,
+                        "max_retries": 1,
+                        "temperature": 0.0,
+                        "top_p": 1.0,
+                        "presence_penalty": 0.0,
+                    },
+                },
+            )
+
+        def call_llm_api(self, msgs, max_tries=10, runtime_deadline=None):
+            return {
+                "status": "ok",
+                "finish_reason": "stop",
+                "content": "done",
+                "tool_calls": [],
+            }
+
+    agent = FakeAgent()
+    session = agent._run_session("Return done.", workspace_root=str(case_dir))
+    workspace_state_path = case_dir / "_session_state.json"
+    workspace_named_state_paths = sorted(case_dir.glob("session_state_*.json"))
+    detail = json.dumps(
+        {
+            "termination": session.get("termination"),
+            "session_state_path": session.get("session_state_path"),
+            "workspace_state_exists": workspace_state_path.exists(),
+            "workspace_named_state_paths": [str(path) for path in workspace_named_state_paths],
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    ok = (
+        session.get("termination") == "result"
+        and session.get("session_state_path") == ""
+        and not workspace_state_path.exists()
+        and not workspace_named_state_paths
+    )
+    return ok, detail
+
+
+def check_tool_schemas_avoid_provider_incompatible_mixed_types() -> tuple[bool, str]:
+    from agent_base.react_agent import ALL_TOOL_MAP
+
+    issues: list[dict[str, object]] = []
+
+    def walk(tool_name: str, path: list[str], value: object) -> None:
+        if isinstance(value, dict):
+            schema_type = value.get("type")
+            if isinstance(schema_type, list):
+                issues.append(
+                    {
+                        "tool": tool_name,
+                        "path": ".".join(path),
+                        "issue": "type-list",
+                        "schema_type": schema_type,
+                    }
+                )
+            if "items" in value and schema_type != "array":
+                issues.append(
+                    {
+                        "tool": tool_name,
+                        "path": ".".join(path),
+                        "issue": "items-on-non-array",
+                        "schema_type": schema_type,
+                    }
+                )
+            for keyword in ("anyOf", "oneOf", "allOf"):
+                if keyword in value:
+                    issues.append(
+                        {
+                            "tool": tool_name,
+                            "path": ".".join(path),
+                            "issue": keyword,
+                            "schema_type": schema_type,
+                        }
+                    )
+            for key, child in value.items():
+                walk(tool_name, path + [str(key)], child)
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                walk(tool_name, path + [str(index)], child)
+
+    for tool_name, tool in ALL_TOOL_MAP.items():
+        walk(tool_name, ["parameters"], getattr(tool, "parameters", {}))
+
+    detail = json.dumps({"issues": issues}, ensure_ascii=False, indent=2)
+    return not issues, detail
+
+
+def main() -> int:
+    bootstrap()
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+
+    checks = [
+        ("Workspace root auto-create", check_workspace_root_is_created_when_missing),
+        ("Required env enforced", check_required_env_is_enforced),
+        ("ReadPDF relative image path", check_readpdf_relative_image_path),
+        ("ReadPDF timeout result", check_readpdf_timeout_returns_tool_result),
+        ("TerminalInterrupt remainder", check_terminal_interrupt_preserves_remainder),
+        ("Agent runtime limit", check_agent_runtime_limit_on_tool_execution),
+        ("LLM hard timeout", check_llm_hard_timeout_interrupts_blocking_call),
+        ("Parallel ReadImage tool order", check_parallel_readimage_tool_message_order),
+        ("Tool execution batches keep mutation boundaries", check_tool_execution_batches_keep_mutation_boundaries),
+        ("DeepSeek ReadImage fallback", check_deepseek_readimage_falls_back_to_text_only_context),
+        ("Old image parts omitted but traced", check_old_image_parts_are_omitted_from_followup_requests_but_traced),
+        ("Reasoning content preserved", check_reasoning_content_is_preserved_across_tool_rounds),
+        ("Visible think/answer tags accepted", check_visible_think_and_answer_tags_are_plain_final_text),
+        ("Tool-like text tags can be final text", check_tool_like_text_tags_can_be_plain_final_text),
+        ("Mixed text and tool calls executed", check_mixed_text_and_tool_calls_are_executed),
+        ("Reasoning replay error reported", check_reasoning_replay_error_is_reported_without_recovery),
+        ("Compact trigger parser", check_compact_trigger_token_parser_supports_k_suffix),
+        ("Model profile output reserve", check_model_profile_respects_configured_output_tokens),
+        ("Default compact trigger formula", check_run_session_uses_formula_when_compact_trigger_is_unset),
+        ("Context compaction persists state", check_context_compaction_persists_summary_and_session_state),
+        ("Session state requires trace dir", check_session_state_is_only_written_with_trace_dir),
+        ("Context compaction refreshes memory", check_context_compaction_refreshes_existing_memory_without_recursive_summary),
+        ("Context compaction failure recorded", check_context_compaction_failure_is_recorded_before_hard_stop),
+        ("Double-encoded tool args unwrapped", check_double_encoded_tool_arguments_are_unwrapped),
+        ("Truncated tool call replay", check_truncated_tool_call_turn_is_replayed_without_execution),
+        ("Terminal error accepts artifact", check_terminal_error_can_be_accepted_after_completion_artifact),
+        ("Claude runtime sampling params", check_claude_models_skip_sampling_params_in_agent_runtime),
+        ("WebFetch range-bounded page text", check_webfetch_returns_range_bounded_page_text_without_summary_llm),
+        ("Tool schema provider compatibility", check_tool_schemas_avoid_provider_incompatible_mixed_types),
+        ("Plaintext result max rounds", check_plaintext_result_rejection_hits_max_rounds),
+        ("Bash output bounding", check_bash_output_bounding_and_repeat_collapse),
+        ("Bash binary output safety", check_bash_handles_binary_and_invalid_utf8_output),
+        ("Tool exception result", check_tool_exception_is_returned_as_tool_result),
+    ]
+
+    previous_compact_trigger = os.environ.get("COMPACT_TRIGGER_TOKENS")
+    os.environ["COMPACT_TRIGGER_TOKENS"] = "8k"
+    try:
+        failures: list[str] = []
+        outputs: list[str] = []
+        for name, func in checks:
+            ok, detail = func()
+            outputs.append(f"[{name}]\n{detail}")
+            if not ok:
+                failures.append(name)
+
+        result = EdgeCaseResult(
+            status="PASS" if not failures else "FAIL",
+            detail="All edge-case checks passed." if not failures else f"Failed checks: {', '.join(failures)}",
+            output_preview=preview("\n\n".join(outputs)),
+        )
+    finally:
+        if previous_compact_trigger is None:
+            os.environ.pop("COMPACT_TRIGGER_TOKENS", None)
+        else:
+            os.environ["COMPACT_TRIGGER_TOKENS"] = previous_compact_trigger
+    print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
+    return 0 if not failures else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
